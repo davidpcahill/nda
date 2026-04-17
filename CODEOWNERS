@@ -1,0 +1,7 @@
+# Every change to the NDA text, signing instructions, or signature files
+# must be reviewed by David before merging.
+
+*            @davidpcahill
+NDA.md       @davidpcahill
+SIGNING.md   @davidpcahill
+/signatures/ @davidpcahill

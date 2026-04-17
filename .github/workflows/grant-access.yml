@@ -1,0 +1,120 @@
+name: Grant access after NDA signing
+
+# Triggers whenever a commit lands on the default branch that touches
+# the signatures/ directory. In practice, that means every time you merge
+# a signer's pull request.
+#
+# This workflow is OPTIONAL. It's a no-op unless you configure:
+#
+#   Variables (always required to enable the workflow):
+#     NDA_ORG   — the GitHub organization slug (e.g. "furbidden").
+#     NDA_TEAM  — the team slug that signers should be added to
+#                 (e.g. "signed-nda").
+#
+#   Auth — pick ONE of the following two options:
+#
+#     Option A (recommended) — GitHub App:
+#       Secret  ORG_ADMIN_APP_ID           — the App ID (a number).
+#       Secret  ORG_ADMIN_APP_PRIVATE_KEY  — full contents of the app's .pem.
+#
+#     Option B — Fine-grained Personal Access Token:
+#       Secret  ORG_ADMIN_TOKEN  — a PAT with the target org's
+#                                  "Members: Read and Write" permission.
+#
+# If both A and B are set, the workflow prefers A (App auth).
+#
+# See SETUP.md section 5 for the full configuration walkthrough.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'signatures/*.md'
+
+permissions:
+  contents: read
+
+jobs:
+  grant-access:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine auth method
+        id: auth
+        env:
+          APP_ID: ${{ secrets.ORG_ADMIN_APP_ID }}
+          APP_KEY: ${{ secrets.ORG_ADMIN_APP_PRIVATE_KEY }}
+          PAT: ${{ secrets.ORG_ADMIN_TOKEN }}
+          ORG: ${{ vars.NDA_ORG }}
+          TEAM: ${{ vars.NDA_TEAM }}
+        run: |
+          if [ -z "$ORG" ] || [ -z "$TEAM" ]; then
+            echo "Auto-invite is not configured (NDA_ORG / NDA_TEAM vars missing). See SETUP.md section 5."
+            echo "method=none" >> "$GITHUB_OUTPUT"
+          elif [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then
+            echo "Using GitHub App auth."
+            echo "method=app" >> "$GITHUB_OUTPUT"
+          elif [ -n "$PAT" ]; then
+            echo "Using PAT auth."
+            echo "method=pat" >> "$GITHUB_OUTPUT"
+          else
+            echo "Auto-invite is not configured (no auth secrets set). See SETUP.md section 5."
+            echo "method=none" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint GitHub App installation token
+        if: steps.auth.outputs.method == 'app'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.ORG_ADMIN_APP_ID }}
+          private-key: ${{ secrets.ORG_ADMIN_APP_PRIVATE_KEY }}
+          owner: ${{ vars.NDA_ORG }}
+
+      - name: Find new signature files in this push
+        if: steps.auth.outputs.method != 'none'
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          # Skip if this is the initial commit to the branch (no BEFORE ref).
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "Initial push — nothing to diff. Skipping."
+            echo "signers=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # List files added in this push.
+          added=$(gh api "repos/$REPO/compare/$BEFORE...$AFTER" \
+            --jq '.files[] | select(.status=="added") | .filename')
+
+          # Keep only files matching signatures/<github-username>.md
+          # (GitHub usernames: 1–39 chars, alphanumeric or hyphen, no leading hyphen).
+          # Exclude TEMPLATE.md.
+          sigs=$(echo "$added" \
+            | grep -E '^signatures/[A-Za-z0-9][A-Za-z0-9-]{0,38}\.md$' \
+            | grep -v '^signatures/TEMPLATE\.md$' || true)
+
+          if [ -z "$sigs" ]; then
+            echo "No new signature files in this push."
+            echo "signers=" >> "$GITHUB_OUTPUT"
+          else
+            usernames=$(echo "$sigs" | sed -E 's|^signatures/(.+)\.md$|\1|' | tr '\n' ' ')
+            echo "New signers: $usernames"
+            echo "signers=$usernames" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Add signers to team
+        if: steps.auth.outputs.method != 'none' && steps.find.outputs.signers != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.ORG_ADMIN_TOKEN }}
+          ORG: ${{ vars.NDA_ORG }}
+          TEAM: ${{ vars.NDA_TEAM }}
+          SIGNERS: ${{ steps.find.outputs.signers }}
+        run: |
+          for user in $SIGNERS; do
+            echo "Adding @$user to $ORG/$TEAM (sends an org invite if they are not already a member)"
+            gh api -X PUT "orgs/$ORG/teams/$TEAM/memberships/$user" -f role=member
+          done
